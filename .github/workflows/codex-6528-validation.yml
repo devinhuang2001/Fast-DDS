@@ -1,0 +1,92 @@
+name: Issue 6528 Linux validation
+on:
+  push:
+    branches: [codex/6528-linux-validation]
+permissions:
+  contents: read
+jobs:
+  regression:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Install build tools
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends build-essential cmake ninja-build python3
+      - name: Build pinned dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --branch v0.7-3 https://github.com/foonathan/memory "$RUNNER_TEMP/memory"
+          git clone --depth 1 --branch v1.14.0 https://github.com/google/googletest "$RUNNER_TEMP/googletest"
+          prefix="$RUNNER_TEMP/install"
+          cmake -S "$RUNNER_TEMP/memory" -B "$RUNNER_TEMP/build-memory" -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$prefix" -DBUILD_SHARED_LIBS=OFF -DFOONATHAN_MEMORY_BUILD_TESTS=OFF -DFOONATHAN_MEMORY_BUILD_EXAMPLES=OFF -DFOONATHAN_MEMORY_BUILD_TOOLS=OFF
+          cmake --build "$RUNNER_TEMP/build-memory" --target install --parallel 4
+          cmake -S "$RUNNER_TEMP/googletest" -B "$RUNNER_TEMP/build-gtest" -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$prefix" -DBUILD_SHARED_LIBS=OFF
+          cmake --build "$RUNNER_TEMP/build-gtest" --target install --parallel 4
+          cmake -S thirdparty/fastcdr -B "$RUNNER_TEMP/build-fastcdr" -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$prefix" -DBUILD_SHARED_LIBS=OFF -DBUILD_TESTING=OFF
+          cmake --build "$RUNNER_TEMP/build-fastcdr" --target install --parallel 4
+      - name: Prepare baseline without the warning fix
+        shell: bash
+        run: |
+          mkdir -p reports
+          cp src/cpp/rtps/participant/RTPSParticipantImpl.cpp "$RUNNER_TEMP/fixed.cpp"
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('src/cpp/rtps/participant/RTPSParticipantImpl.cpp')
+          text = p.read_text()
+          method = text.index('bool RTPSParticipantImpl::createReceiverResources(')
+          start = text.index('            if (loc != *it_loc)\n', method)
+          end = text.index('            Locator_list.push_back(loc);', start)
+          assert 'Requested receiver locator' in text[start:end]
+          assert 'EPROSIMA_LOG_WARNING' in text[start:end]
+          p.write_text(text[:start] + text[end:])
+          PY
+      - name: Build instrumented Release baseline
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH="$RUNNER_TEMP/install" -DBUILD_SHARED_LIBS=OFF -DSECURITY=OFF -DTHIRDPARTY=ON -DEPROSIMA_BUILD_TESTS=ON -DCMAKE_CXX_FLAGS=--coverage -DCMAKE_C_FLAGS=--coverage -DCMAKE_POLICY_VERSION_MINIMUM=3.5
+          cmake --build build --target RTPSParticipantTests --parallel 4
+      - name: Verify the two baseline regression failures
+        shell: bash
+        run: |
+          set +e
+          build/test/unittest/rtps/participant/RTPSParticipantTests --gtest_output=xml:reports/baseline.xml > reports/baseline.log 2>&1
+          code=$?
+          set -e
+          cat reports/baseline.log
+          test "$code" -ne 0
+          python3 - <<'PY'
+          import xml.etree.ElementTree as ET
+          root = ET.parse('reports/baseline.xml').getroot()
+          failed = {t.attrib['name'] for t in root.iter('testcase') if t.find('failure') is not None}
+          expected = {'successful_binding_reports_only_actual_mutations/1', 'successful_binding_reports_only_actual_mutations/2'}
+          assert failed == expected, failed
+          assert int(root.attrib['tests']) == 5, root.attrib
+          print('Baseline reproduced: exactly the two missing-warning cases fail.')
+          PY
+      - name: Restore fix and rebuild
+        run: |
+          cp "$RUNNER_TEMP/fixed.cpp" src/cpp/rtps/participant/RTPSParticipantImpl.cpp
+          find build -type f -name '*.gcda' -delete
+          cmake --build build --target RTPSParticipantTests --parallel 4
+      - name: Run fixed suite and repeat regression cases
+        shell: bash
+        run: |
+          set -euo pipefail
+          ctest --test-dir build/test/unittest/rtps/participant --output-on-failure --output-junit "$GITHUB_WORKSPACE/reports/ctest.xml" | tee reports/ctest.log
+          build/test/unittest/rtps/participant/RTPSParticipantTests '--gtest_filter=*ReceiverPortMutationTests*' --gtest_repeat=20 | tee reports/repeat.log
+          test "$(grep -c '^\[  PASSED  \] 4 tests\.$' reports/repeat.log)" -eq 20
+      - name: Collect receiver resource coverage
+        run: |
+          mkdir -p reports/coverage
+          cd reports/coverage
+          gcov -b -c ../../build/src/cpp/CMakeFiles/fastdds.dir/rtps/participant/RTPSParticipantImpl.cpp.gcno > summary.txt
+          cat summary.txt
+          grep -n -A 8 -B 3 'Requested receiver locator' RTPSParticipantImpl.cpp.gcov
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: issue-6528-linux-validation
+          path: reports/
+          retention-days: 14
